@@ -37,8 +37,8 @@ except OSError as e:
 _SESSION_RE = re.compile(r'^[0-9a-f]{32}$')
 _COLOR_RE   = re.compile(r'^#[0-9A-Fa-f]{6}([0-9A-Fa-f]{2})?$')
 
-# Maps session_id -> original filename (without .3mf extension)
-_session_names: dict[str, str] = {}
+# Session names are persisted to disk as {session_id}_name.txt so they
+# survive multiple workers and container restarts.
 
 # ---------------------------------------------------------------------------
 # Filament profiles (loaded once at startup)
@@ -69,6 +69,8 @@ def cleanup_old_files() -> None:
     cutoff = MAX_FILE_AGE_HOURS * 3600
     try:
         for name in os.listdir(UPLOAD_FOLDER):
+            if not (name.endswith('.3mf') or name.endswith('_name.txt')):
+                continue
             path = os.path.join(UPLOAD_FOLDER, name)
             if os.path.isfile(path) and (now - os.path.getmtime(path)) > cutoff:
                 os.remove(path)
@@ -79,11 +81,6 @@ def cleanup_old_files() -> None:
 
 def _schedule_cleanup(interval: int = 3600) -> None:
     cleanup_old_files()
-    # Also purge stale entries from _session_names
-    for name in list(_session_names):
-        path = _safe_path(f'{name}_input.3mf')
-        if path is None or not os.path.exists(path):
-            _session_names.pop(name, None)
     t = Timer(interval, _schedule_cleanup, [interval])
     t.daemon = True          # don't prevent process exit
     t.start()
@@ -137,6 +134,18 @@ def parse_bambu_filaments(filepath: str) -> list[dict]:
     return filaments
 
 
+def _session_name(session_id: str) -> str:
+    """Read the original filename for a session from disk, fallback to 'converted'."""
+    name_path = _safe_path(f'{session_id}_name.txt')
+    if name_path and os.path.exists(name_path):
+        try:
+            with open(name_path, 'r', encoding='utf-8') as nf:
+                return nf.read().strip() or 'converted'
+        except OSError:
+            pass
+    return 'converted'
+
+
 def _safe_path(filename: str) -> str | None:
     safe_dir  = os.path.realpath(UPLOAD_FOLDER)
     candidate = os.path.realpath(os.path.join(safe_dir, filename))
@@ -176,13 +185,21 @@ def analyze():
     safe_name = _werkzeug_secure(raw_name) or 'converted'
 
     session_id     = uuid.uuid4().hex          # 32 hex chars, full 128-bit entropy
-    _session_names[session_id] = safe_name
     input_filename = f'{session_id}_input.3mf'
     filepath       = _safe_path(input_filename)
     if filepath is None:
         return jsonify({'error': 'Internal path error'}), 500
 
     file.save(filepath)
+
+    # Persist original name to disk so it survives multi-worker / restart scenarios
+    name_path = _safe_path(f'{session_id}_name.txt')
+    if name_path:
+        try:
+            with open(name_path, 'w', encoding='utf-8') as nf:
+                nf.write(safe_name)
+        except OSError as e:
+            logger.warning("Could not write name file for session %s: %s", session_id, e)
 
     # Validate ZIP magic bytes
     with open(filepath, 'rb') as f:
@@ -373,7 +390,7 @@ def convert():
 
         return jsonify({
             'download_url': f'/download/{session_id}_U1_Ready.3mf',
-            'download_name': f'{_session_names.get(session_id, "converted")}-U1.3mf',
+            'download_name': f'{_session_name(session_id)}_u1.3mf',
         })
 
     except Exception as e:
@@ -396,7 +413,7 @@ def download_file(filename: str):
         return jsonify({'error': 'File not found'}), 404
     # Use original filename if available
     session_id = filename[:32]
-    download_name = f'{_session_names.get(session_id, "converted")}-U1.3mf'
+    download_name = f'{_session_name(session_id)}_u1.3mf'
     return send_file(filepath, as_attachment=True, download_name=download_name)
 
 
